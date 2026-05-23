@@ -36,4 +36,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/k8s_FastAPI:${{ github.sha }}
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/k8s_fastapi:${{ github.sha }}
