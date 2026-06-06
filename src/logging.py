@@ -23,11 +23,19 @@ class JSONFormatter(logging.Formatter):
             "request_id": request_id_var.get("-"),
             "message": record.getMessage(),
         }
-
-        # Attach any extra kwargs passed to the log call
         for key, value in record.__dict__.items():
-            if key not in logging.LogRecord.__dict__ and key not in self.RESERVED:
-                payload[key] = value
+            if key in {
+                        "name", "msg", "args", "levelname", "levelno",
+                        "pathname", "filename", "module", "exc_info",
+                        "exc_text", "stack_info", "lineno", "funcName",
+                        "created", "msecs", "relativeCreated", "thread",
+                        "threadName", "processName", "process"
+                        }:
+                continue  # skip standard noisy fields
+            if key.startswith("_"):
+                continue
+
+            payload[key] = value
 
         # Attach exception info when present
         if record.exc_info:
