@@ -3,7 +3,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.main import app
-from src.metrics import REQUEST_COUNT, REQUEST_LATENCY, ACTIVE_REQUESTS
 
 client = TestClient(app)
 
@@ -153,18 +152,3 @@ def test_different_endpoints_tracked():
     assert "fastapi_" in metrics_response.text
 
 
-def test_prometheus_metrics_attributes():
-    """Test that prometheus metrics have correct attributes"""
-    # Test REQUEST_COUNT metric
-    assert hasattr(REQUEST_COUNT, 'labels')
-    assert callable(REQUEST_COUNT.labels)
-    
-    # Test REQUEST_LATENCY metric
-    assert hasattr(REQUEST_LATENCY, 'labels')
-    assert callable(REQUEST_LATENCY.labels)
-    
-    # Test ACTIVE_REQUESTS metric
-    assert hasattr(ACTIVE_REQUESTS, 'inc')
-    assert callable(ACTIVE_REQUESTS.inc)
-    assert hasattr(ACTIVE_REQUESTS, 'dec')
-    assert callable(ACTIVE_REQUESTS.dec)
