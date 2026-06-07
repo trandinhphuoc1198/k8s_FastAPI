@@ -29,7 +29,7 @@ class JSONFormatter(logging.Formatter):
                         "pathname", "filename", "module", "exc_info",
                         "exc_text", "stack_info", "lineno", "funcName",
                         "created", "msecs", "relativeCreated", "thread",
-                        "threadName", "processName", "process"
+                        "threadName", "processName", "process", "taskName"
                         }:
                 continue  # skip standard noisy fields
             if key.startswith("_"):
