@@ -2,6 +2,7 @@ import time
 import uuid
 
 from fastapi import FastAPI, HTTPException, Request
+from src.routes import compute
 from fastapi.responses import Response
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
@@ -90,6 +91,10 @@ async def prometheus_middleware(request: Request, call_next):
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
+
+app.include_router(compute.router)
+
+
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
@@ -117,60 +122,3 @@ def list_tables():
         logger.error("failed to list tables", extra={"error": str(exc)}, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
     
-
-# ================================
-# CPU-heavy function
-# ================================
-def count_primes(n: int) -> int:
-    count = 0
-    for num in range(2, n):
-        is_prime = True
-        for i in range(2, int(num ** 0.5) + 1):
-            if num % i == 0:
-                is_prime = False
-                break
-        if is_prime:
-            count += 1
-    return count
-
-
-
-# ================================
-# Compute endpoint
-# ================================
-@app.get("/compute/{n}")
-def compute(n: int):
-    start = time.time()
-
-    logger.info("compute started", extra={"input": n})
-
-    try:
-        result = count_primes(n)
-    except Exception as e:
-        logger.error(
-            "compute failed",
-            extra={
-                "input": n,
-                "error.message": str(e),
-                "error.type": type(e).__name__,
-            },
-            exc_info=True,
-        )
-        raise
-
-    duration = time.time() - start
-
-    logger.info(
-        "compute finished",
-        extra={
-            "input": n,
-            "result": result,
-            "duration_ms": round(duration * 1000, 2),
-        },
-    )
-
-    return {
-        "input": n,
-        "result": result,
-        "duration_ms": round(duration * 1000, 2),
-    }
