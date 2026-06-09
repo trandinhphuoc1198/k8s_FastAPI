@@ -1,19 +1,19 @@
-from fastapi import FastAPI
-from prometheus_fastapi_instrumentator import Instrumentator
-
 import time
 import uuid
-from fastapi import FastAPI, HTTPException, Request
-from src.routes import compute
 
-from src.database import get_tables
+from fastapi import FastAPI, HTTPException, Request
+from prometheus_fastapi_instrumentator import Instrumentator
+
+from src.routes import compute, db
 from src.logging import configure_root_logging, get_logger, request_id_var
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
+
 configure_root_logging(level="INFO")
 logger = get_logger(__name__)
 
 # ── App ────────────────────────────────────────────────────────────────────────
+
 app = FastAPI(root_path="/fastapi-app", title="k8s FastAPI", version="1.0.0")
 Instrumentator().instrument(app).expose(app)
 
@@ -67,13 +67,14 @@ async def logging_middleware(request: Request, call_next):
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
-
 app.include_router(compute.router)
+app.include_router(db.router)
 
 
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
 
 @app.get("/fail")
 def fail():
@@ -82,13 +83,3 @@ def fail():
     except Exception as exc:
         logger.error("intentional failure triggered", extra={"error": str(exc)}, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
-
-@app.get("/db")
-def list_tables():
-    try:
-        tables = get_tables()
-        return {"database": "TestDb", "tables": tables}
-    except Exception as exc:
-        logger.error("failed to list tables", extra={"error": str(exc)}, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
-    
