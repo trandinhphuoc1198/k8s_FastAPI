@@ -27,7 +27,6 @@ DB_NAME = os.getenv("DB_NAME", "TestDb")
 DB_WRITER_HOST = os.getenv("DB_WRITER_HOST", "localhost")
 DB_READER_HOST = os.getenv("DB_READER_HOST", "localhost")
 
-TEST_DB_NAME = "test_db"
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -74,7 +73,7 @@ SessionFactory: sessionmaker[RoutingSession] = sessionmaker(
 )
 
 
-def _make_test_session_factory(db_name: str = TEST_DB_NAME) -> sessionmaker:
+def _make_test_session_factory(db_name: str = DB_NAME) -> sessionmaker:
     """
     Build a RoutingSession factory pointed at a specific database.
     Creates short-lived engines that are disposed when the session closes.
@@ -123,30 +122,30 @@ def create_test_database_and_table() -> None:
     """
     Create the test database (if it does not exist) and sync the ORM schema into it.
     CREATE DATABASE must run outside a transaction, so we use a raw AUTOCOMMIT
-    connection here — all other operations go through RoutingSession as normal.
-    """
-    with writer_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        exists = conn.execute(
-            text("SELECT 1 FROM pg_database WHERE datname = :db"),
-            {"db": TEST_DB_NAME},
-        ).scalar()
+    # connection here — all other operations go through RoutingSession as normal.
+    # """
+    # with writer_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+    #     exists = conn.execute(
+    #         text("SELECT 1 FROM pg_database WHERE datname = :db"),
+    #         {"db": DB_NAME},
+    #     ).scalar()
 
-        if not exists:
-            conn.execute(text(f'CREATE DATABASE "{TEST_DB_NAME}"'))
-            logger.info("test database created", extra={"db.name": TEST_DB_NAME})
-        else:
-            logger.debug("test database already exists", extra={"db.name": TEST_DB_NAME})
+    #     if not exists:
+    #         conn.execute(text(f'CREATE DATABASE "{DB_NAME}"'))
+    #         logger.info("test database created", extra={"db.name": DB_NAME})
+    #     else:
+    #         logger.debug("test database already exists", extra={"db.name": DB_NAME})
 
     # Schema sync via ORM — no raw DDL needed
-    test_writer = create_engine(_build_connection_url(DB_WRITER_HOST, db_name=TEST_DB_NAME))
+    test_writer = create_engine(_build_connection_url(DB_WRITER_HOST, db_name=DB_NAME))
     try:
         Base.metadata.create_all(bind=test_writer)
         logger.info(
             "test schema synced",
-            extra={"db.name": TEST_DB_NAME, "db.table": TestItem.__tablename__},
+            extra={"db.name": DB_NAME, "db.table": TestItem.__tablename__},
         )
     except Exception:
-        logger.exception("error syncing test schema", extra={"db.name": TEST_DB_NAME})
+        logger.exception("error syncing test schema", extra={"db.name": DB_NAME})
         raise
     finally:
         test_writer.dispose()
@@ -178,7 +177,7 @@ def insert_test_data(n: int = 10) -> list[dict]:
             logger.info(
                 "inserted test data",
                 extra={
-                    "db.name": TEST_DB_NAME,
+                    "db.name": DB_NAME,
                     "db.table": TestItem.__tablename__,
                     "db.row_count": n,
                 },
@@ -187,7 +186,7 @@ def insert_test_data(n: int = 10) -> list[dict]:
     except Exception:
         logger.exception(
             "error inserting test data",
-            extra={"db.name": TEST_DB_NAME, "db.table": TestItem.__tablename__},
+            extra={"db.name": DB_NAME, "db.table": TestItem.__tablename__},
         )
         raise
 
@@ -208,7 +207,7 @@ def get_test_records() -> list[dict]:
             logger.debug(
                 "fetched test records",
                 extra={
-                    "db.name": TEST_DB_NAME,
+                    "db.name": DB_NAME,
                     "db.table": TestItem.__tablename__,
                     "db.row_count": len(items),
                 },
@@ -217,6 +216,6 @@ def get_test_records() -> list[dict]:
     except Exception:
         logger.exception(
             "error fetching test records",
-            extra={"db.name": TEST_DB_NAME, "db.table": TestItem.__tablename__},
+            extra={"db.name": DB_NAME, "db.table": TestItem.__tablename__},
         )
         raise

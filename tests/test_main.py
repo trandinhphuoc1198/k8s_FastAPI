@@ -153,20 +153,6 @@ def _make_autocommit_conn(db_exists: bool) -> MagicMock:
     return engine_conn, conn
 
 
-def test_create_test_db_issues_create_database_when_missing():
-    engine_conn, conn = _make_autocommit_conn(db_exists=False)
-
-    with (
-        patch("src.database.writer_engine") as mock_writer,
-        patch("src.database.create_engine"),
-        patch("src.database.Base.metadata.create_all"),
-    ):
-        mock_writer.connect.return_value = engine_conn
-        create_test_database_and_table()
-
-    executed = [str(c.args[0]) for c in conn.execute.call_args_list]
-    assert any("CREATE DATABASE" in s for s in executed)
-
 
 def test_create_test_db_skips_create_database_when_exists():
     engine_conn, conn = _make_autocommit_conn(db_exists=True)
