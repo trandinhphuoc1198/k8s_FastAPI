@@ -24,7 +24,7 @@ def list_tables():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@router.post("/test/setup", status_code=201)
+@router.get("/test/setup", status_code=201)
 def setup_test_db():
     """Create the test database and test table if they do not already exist."""
     try:
@@ -35,7 +35,7 @@ def setup_test_db():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@router.post("/test/seed", status_code=201)
+@router.get("/test/seed", status_code=201)
 def seed_test_data(
     n: int = Query(default=10, ge=1, le=1000, description="Number of random rows to insert"),
 ):
