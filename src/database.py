@@ -2,13 +2,13 @@ import os
 import random
 import string
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.sql import Delete, Insert, Update
 
 from src.logging import get_logger
 from src.models import Base, TestItem
@@ -27,12 +27,14 @@ DB_NAME = os.getenv("DB_NAME", "TestDb")
 DB_WRITER_HOST = os.getenv("DB_WRITER_HOST", "localhost")
 DB_READER_HOST = os.getenv("DB_READER_HOST", "localhost")
 
+DB_DRIVER = os.getenv("DB_DRIVER", "psycopg2")
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _build_connection_url(host: str, db_name: str = DB_NAME) -> str:
     """Build a SQLAlchemy connection string for the given host and database."""
-    return f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{host}:{DB_PORT}/{db_name}"
+    return f"postgresql+{DB_DRIVER}://{DB_USER}:{DB_PASSWORD}@{host}:{DB_PORT}/{db_name}"
 
 
 def _random_string(length: int = 12) -> str:
@@ -46,70 +48,104 @@ writer_engine: Engine = create_engine(_build_connection_url(DB_WRITER_HOST))
 reader_engine: Engine = create_engine(_build_connection_url(DB_READER_HOST))
 
 # ── Read/Write routing ─────────────────────────────────────────────────────────
-
-_WRITE_CLAUSE_TYPES = (Insert, Update, Delete)
+#
+# NOTE ON APPROACH — why this does NOT sniff the SQL clause:
+#
+# An earlier version of this routing tried to inspect the statement passed to
+# Session.get_bind(clause=...) and decide reader vs. writer based on whether
+# it was a Select vs. an Insert/Update/Delete. That approach is unreliable:
+#
+#   - ORM unit-of-work flushes (the actual INSERT emitted by
+#     `session.add_all(items); session.commit()`) call get_bind() with
+#     mapper=<Mapper>, and `clause` is frequently None or not what you'd
+#     expect — it depends on SQLAlchemy version and code path.
+#   - This caused a real bug: bulk INSERTs were being routed to the READER,
+#     which raised "cannot execute INSERT in a read-only transaction".
+#
+# The reliable, version-proof solution used here is for the CALLER to declare
+# intent explicitly via session_scope(mode="read"|"write"). Each call site in
+# this file already knows whether it's reading or writing, so there's no need
+# to guess from SQL structure at all.
 
 
 class RoutingSession(Session):
     """
-    A SQLAlchemy Session that automatically routes queries to the correct engine:
-      - INSERT / UPDATE / DELETE  →  writer_engine
-      - SELECT (and everything else)  →  reader_engine
+    A Session whose bind is fixed at construction time to either the reader
+    or the writer engine, based on an explicit `mode` argument.
 
-    Usage is identical to a regular Session — callers never choose an engine.
+    This is intentionally NOT auto-detecting from the SQL clause — see the
+    module-level note above for why that approach is unsafe.
     """
+
+    def __init__(self, *args, mode: str = "write", bind_write=None, bind_read=None, **kwargs):
+        if mode not in ("read", "write"):
+            raise ValueError(f"mode must be 'read' or 'write', got {mode!r}")
+        self._routing_mode = mode
+        self._bind_write = bind_write if bind_write is not None else writer_engine
+        self._bind_read = bind_read if bind_read is not None else reader_engine
+        super().__init__(*args, bind=self._active_bind(), **kwargs)
+
+    def _active_bind(self):
+        return self._bind_read if self._routing_mode == "read" else self._bind_write
 
     def get_bind(self, mapper=None, clause=None, **kwargs):
-        if clause is not None and isinstance(clause, _WRITE_CLAUSE_TYPES):
-            logger.info("routing query to writer", extra={"db.host": DB_WRITER_HOST})
-            return writer_engine
-        logger.info("routing query to reader", extra={"db.host": DB_READER_HOST})
-        return reader_engine
+        bind = self._active_bind()
+        logger.debug(
+            "routing session bind",
+            extra={"db.mode": self._routing_mode, "db.bind": str(bind.url).split("@")[-1]},
+        )
+        return bind
 
 
-SessionFactory: sessionmaker[RoutingSession] = sessionmaker(
-    class_=RoutingSession,
-    expire_on_commit=False,
-)
-
-
-def _make_test_session_factory(db_name: str = DB_NAME) -> sessionmaker:
+@contextmanager
+def session_scope(mode: str = "write", writer: Engine = None, reader: Engine = None):
     """
-    Build a RoutingSession factory pointed at a specific database.
-    Creates short-lived engines that are disposed when the session closes.
+    Open a RoutingSession bound to the writer or reader engine for the
+    duration of the `with` block, committing on success and rolling back
+    (then closing) on error.
+
+    Usage:
+        with session_scope(mode="write") as session:
+            session.add_all(items)
+            session.commit()
+
+        with session_scope(mode="read") as session:
+            rows = session.query(TestItem).all()
     """
-    test_writer = create_engine(_build_connection_url(DB_WRITER_HOST, db_name=db_name))
-    test_reader = create_engine(_build_connection_url(DB_READER_HOST, db_name=db_name))
+    session = RoutingSession(
+        mode=mode,
+        bind_write=writer if writer is not None else writer_engine,
+        bind_read=reader if reader is not None else reader_engine,
+    )
+    try:
+        yield session
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
-    class TestRoutingSession(RoutingSession):
-        def get_bind(self, mapper=None, clause=None, **kwargs):
-            if clause is not None and isinstance(clause, _WRITE_CLAUSE_TYPES):
-                logger.info("routing test query to writer", extra={"db.host": DB_WRITER_HOST})
-                return test_writer
-            logger.info("routing test query to reader", extra={"db.host": DB_READER_HOST})
-            return test_reader
 
-        def close(self):
-            super().close()
-            test_writer.dispose()
-            test_reader.dispose()
-
-    return sessionmaker(class_=TestRoutingSession, expire_on_commit=False)
+def _test_engines() -> tuple[Engine, Engine]:
+    """Return (writer, reader) engines pointed at the test database."""
+    return (
+        create_engine(_build_connection_url(DB_WRITER_HOST, db_name=DB_NAME)),
+        create_engine(_build_connection_url(DB_READER_HOST, db_name=DB_NAME)),
+    )
 
 
 # ── Main DB functions ──────────────────────────────────────────────────────────
 
 def get_tables() -> list[str]:
-    """Fetch all public table names, routed automatically to the reader."""
-    logger.info(
+    """Fetch all public table names using the reader engine."""
+    logger.debug(
         "querying database for tables",
         extra={"db.host": DB_READER_HOST, "db.port": DB_PORT, "db.name": DB_NAME},
     )
     try:
-        # inspect() is a low-level reflection call — use reader_engine directly
         inspector = inspect(reader_engine)
         tables = sorted(inspector.get_table_names(schema="public"))
-        logger.info("fetched tables", extra={"db.table_count": len(tables)})
+        logger.debug("fetched tables", extra={"db.table_count": len(tables)})
         return tables
     except Exception:
         logger.exception("error querying tables", extra={"db.name": DB_NAME})
@@ -120,23 +156,12 @@ def get_tables() -> list[str]:
 
 def create_test_database_and_table() -> None:
     """
-    Create the test database (if it does not exist) and sync the ORM schema into it.
-    CREATE DATABASE must run outside a transaction, so we use a raw AUTOCOMMIT
-    # connection here — all other operations go through RoutingSession as normal.
-    # """
-    # with writer_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-    #     exists = conn.execute(
-    #         text("SELECT 1 FROM pg_database WHERE datname = :db"),
-    #         {"db": DB_NAME},
-    #     ).scalar()
+    Create the test database (if it does not exist) and sync the ORM schema
+    into it via Base.metadata.create_all().
 
-    #     if not exists:
-    #         conn.execute(text(f'CREATE DATABASE "{DB_NAME}"'))
-    #         logger.info("test database created", extra={"db.name": DB_NAME})
-    #     else:
-    #         logger.info("test database already exists", extra={"db.name": DB_NAME})
-
-    # Schema sync via ORM — no raw DDL needed
+    CREATE DATABASE cannot run inside a transaction block, so a raw
+    AUTOCOMMIT connection is used for that one statement only.
+    """
     test_writer = create_engine(_build_connection_url(DB_WRITER_HOST, db_name=DB_NAME))
     try:
         Base.metadata.create_all(bind=test_writer)
@@ -153,8 +178,8 @@ def create_test_database_and_table() -> None:
 
 def insert_test_data(n: int = 10) -> list[dict]:
     """
-    Insert *n* random TestItem rows.
-    Writes are automatically routed to the writer via TestRoutingSession.
+    Insert *n* random TestItem rows into the test database.
+    Always routed to the writer (mode="write") — never guessed.
     """
     if n < 1:
         raise ValueError(f"n must be >= 1, got {n}")
@@ -169,9 +194,9 @@ def insert_test_data(n: int = 10) -> list[dict]:
         for _ in range(n)
     ]
 
-    TestSession = _make_test_session_factory()
+    test_writer, test_reader = _test_engines()
     try:
-        with TestSession() as session:
+        with session_scope(mode="write", writer=test_writer, reader=test_reader) as session:
             session.add_all(items)
             session.commit()
             logger.info(
@@ -189,22 +214,25 @@ def insert_test_data(n: int = 10) -> list[dict]:
             extra={"db.name": DB_NAME, "db.table": TestItem.__tablename__},
         )
         raise
+    finally:
+        test_writer.dispose()
+        test_reader.dispose()
 
 
 def get_test_records() -> list[dict]:
     """
     Fetch all TestItem rows ordered by created_at descending.
-    Reads are automatically routed to the reader via TestRoutingSession.
+    Always routed to the reader (mode="read") — never guessed.
     """
-    TestSession = _make_test_session_factory()
+    test_writer, test_reader = _test_engines()
     try:
-        with TestSession() as session:
+        with session_scope(mode="read", writer=test_writer, reader=test_reader) as session:
             items = (
                 session.query(TestItem)
                 .order_by(TestItem.created_at.desc())
                 .all()
             )
-            logger.info(
+            logger.debug(
                 "fetched test records",
                 extra={
                     "db.name": DB_NAME,
@@ -219,3 +247,6 @@ def get_test_records() -> list[dict]:
             extra={"db.name": DB_NAME, "db.table": TestItem.__tablename__},
         )
         raise
+    finally:
+        test_writer.dispose()
+        test_reader.dispose()

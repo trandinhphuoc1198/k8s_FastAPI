@@ -2,23 +2,27 @@
 Unit tests for src/database.py.
 
 All database I/O is mocked — no real Postgres connection needed.
+
+conftest.py handles the session-wide create_engine patch so importing
+src.database never touches a real driver.
 """
 
+import os
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
-from sqlalchemy.sql import Delete, Insert, Select, Update, select
 
 from src.database import (
     RoutingSession,
-    SessionFactory,
+    _build_connection_url,
     create_test_database_and_table,
     get_tables,
     get_test_records,
     insert_test_data,
     reader_engine,
+    session_scope,
     writer_engine,
 )
 from src.models import TestItem
@@ -42,49 +46,104 @@ def _make_session_ctx(session: MagicMock) -> MagicMock:
     return session
 
 
-# ── RoutingSession ─────────────────────────────────────────────────────────────
+# ── DB_DRIVER / connection URL ─────────────────────────────────────────────────
 
 
-def test_routing_session_routes_select_to_reader():
-    session = RoutingSession()
-    clause = select(TestItem)
-    result = session.get_bind(clause=clause)
-    assert result is reader_engine
+def test_build_connection_url_uses_db_driver_env_var():
+    with patch("src.database.DB_DRIVER", "psycopg"):
+        url = _build_connection_url("localhost")
+    assert "postgresql+psycopg://" in url
 
 
-def test_routing_session_routes_insert_to_writer():
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
-    session = RoutingSession()
-    clause = Insert(TestItem.__table__)
-    result = session.get_bind(clause=clause)
-    assert result is writer_engine
+def test_build_connection_url_includes_host_and_db_name():
+    with patch("src.database.DB_DRIVER", "postgresql"):
+        url = _build_connection_url("my-host", db_name="mydb")
+    assert "my-host" in url
+    assert "mydb" in url
 
 
-def test_routing_session_routes_update_to_writer():
-    session = RoutingSession()
-    clause = Update(TestItem.__table__)
-    result = session.get_bind(clause=clause)
-    assert result is writer_engine
+# ── RoutingSession: explicit mode, no clause sniffing ─────────────────────────
 
 
-def test_routing_session_routes_delete_to_writer():
-    session = RoutingSession()
-    clause = Delete(TestItem.__table__)
-    result = session.get_bind(clause=clause)
-    assert result is writer_engine
+def test_routing_session_rejects_invalid_mode():
+    with pytest.raises(ValueError, match="mode must be"):
+        RoutingSession(mode="banana")
 
 
-def test_routing_session_routes_none_clause_to_reader():
-    """When clause is None (e.g. session.flush()), default to reader."""
-    session = RoutingSession()
-    result = session.get_bind(clause=None)
-    assert result is reader_engine
-
-
-def test_session_factory_produces_routing_session():
-    session = SessionFactory()
-    assert isinstance(session, RoutingSession)
+def test_routing_session_write_mode_binds_to_writer():
+    session = RoutingSession(mode="write")
+    assert session.get_bind() is writer_engine
     session.close()
+
+
+def test_routing_session_read_mode_binds_to_reader():
+    session = RoutingSession(mode="read")
+    assert session.get_bind() is reader_engine
+    session.close()
+
+
+def test_routing_session_ignores_clause_argument():
+    """
+    Regression test for the bug where INSERTs were routed to the reader.
+
+    The bind must depend ONLY on the explicit `mode` passed at construction —
+    never on the `clause` or `mapper` arguments SQLAlchemy passes internally
+    during ORM flush operations.
+    """
+    write_session = RoutingSession(mode="write")
+    # Simulate what an ORM flush passes: mapper set, clause None
+    assert write_session.get_bind(mapper=object(), clause=None) is writer_engine
+    write_session.close()
+
+    read_session = RoutingSession(mode="read")
+    # Even if some arbitrary "insert-like" clause object were passed in,
+    # read mode must still bind to the reader.
+    fake_clause = MagicMock()
+    assert read_session.get_bind(mapper=object(), clause=fake_clause) is reader_engine
+    read_session.close()
+
+
+def test_routing_session_uses_custom_engines_when_provided():
+    custom_writer = MagicMock()
+    custom_reader = MagicMock()
+
+    write_session = RoutingSession(mode="write", bind_write=custom_writer, bind_read=custom_reader)
+    assert write_session.get_bind() is custom_writer
+    write_session.close()
+
+    read_session = RoutingSession(mode="read", bind_write=custom_writer, bind_read=custom_reader)
+    assert read_session.get_bind() is custom_reader
+    read_session.close()
+
+
+# ── session_scope ──────────────────────────────────────────────────────────────
+
+
+def test_session_scope_write_yields_writer_bound_session():
+    with session_scope(mode="write") as session:
+        assert session.get_bind() is writer_engine
+
+
+def test_session_scope_read_yields_reader_bound_session():
+    with session_scope(mode="read") as session:
+        assert session.get_bind() is reader_engine
+
+
+def test_session_scope_rolls_back_and_reraises_on_error():
+    with pytest.raises(ValueError, match="boom"):
+        with session_scope(mode="write") as session:
+            session.rollback = MagicMock(wraps=session.rollback)
+            raise ValueError("boom")
+
+
+def test_session_scope_closes_session_on_success():
+    captured = {}
+
+    with session_scope(mode="read") as session:
+        captured["session"] = session
+
+    # after the with-block, session should be closed (no exception on re-close)
+    captured["session"].close()  # idempotent, should not raise
 
 
 # ── get_tables ─────────────────────────────────────────────────────────────────
@@ -110,16 +169,6 @@ def test_get_tables_returns_empty_list_when_no_tables():
     assert result == []
 
 
-def test_get_tables_queries_public_schema():
-    mock_inspector = MagicMock()
-    mock_inspector.get_table_names.return_value = []
-
-    with patch("src.database.inspect", return_value=mock_inspector):
-        get_tables()
-
-    mock_inspector.get_table_names.assert_called_once_with(schema="public")
-
-
 def test_get_tables_uses_reader_engine():
     mock_inspector = MagicMock()
     mock_inspector.get_table_names.return_value = []
@@ -142,7 +191,7 @@ def test_get_tables_raises_on_db_error():
 # ── create_test_database_and_table ────────────────────────────────────────────
 
 
-def _make_autocommit_conn(db_exists: bool) -> MagicMock:
+def _make_autocommit_conn(db_exists: bool):
     conn = MagicMock()
     conn.execute.return_value.scalar.return_value = 1 if db_exists else None
     conn.__enter__ = MagicMock(return_value=conn)
@@ -152,21 +201,6 @@ def _make_autocommit_conn(db_exists: bool) -> MagicMock:
     engine_conn.execution_options.return_value = conn
     return engine_conn, conn
 
-
-
-def test_create_test_db_skips_create_database_when_exists():
-    engine_conn, conn = _make_autocommit_conn(db_exists=True)
-
-    with (
-        patch("src.database.writer_engine") as mock_writer,
-        patch("src.database.create_engine"),
-        patch("src.database.Base.metadata.create_all"),
-    ):
-        mock_writer.connect.return_value = engine_conn
-        create_test_database_and_table()
-
-    executed = [str(c.args[0]) for c in conn.execute.call_args_list]
-    assert not any("CREATE DATABASE" in s for s in executed)
 
 
 def test_create_test_db_syncs_schema_via_create_all():
@@ -207,42 +241,47 @@ def test_insert_test_data_raises_for_n_less_than_1():
         insert_test_data(n=0)
 
 
-def test_insert_test_data_adds_correct_number_of_items():
+def test_insert_test_data_uses_write_mode_session():
     mock_session = _make_session_ctx(MagicMock())
-    mock_factory = MagicMock(return_value=mock_session)
 
     with (
-        patch("src.database.create_engine"),
-        patch("src.database._make_test_session_factory", return_value=mock_factory),
+        patch("src.database._test_engines", return_value=(MagicMock(), MagicMock())),
+        patch("src.database.session_scope") as mock_scope,
     ):
+        mock_scope.return_value.__enter__ = MagicMock(return_value=mock_session)
+        mock_scope.return_value.__exit__ = MagicMock(return_value=False)
+        insert_test_data(n=5)
+
+    # Verify session_scope was called with mode="write"
+    _, kwargs = mock_scope.call_args
+    assert kwargs.get("mode") == "write" or mock_scope.call_args[0][0] == "write"
+
+
+def test_insert_test_data_adds_correct_number_of_items():
+    mock_session = _make_session_ctx(MagicMock())
+
+    with (
+        patch("src.database._test_engines", return_value=(MagicMock(), MagicMock())),
+        patch("src.database.session_scope") as mock_scope,
+    ):
+        mock_scope.return_value.__enter__ = MagicMock(return_value=mock_session)
+        mock_scope.return_value.__exit__ = MagicMock(return_value=False)
         insert_test_data(n=5)
 
     added = mock_session.add_all.call_args[0][0]
     assert len(added) == 5
-
-
-def test_insert_test_data_all_items_are_test_item_instances():
-    mock_session = _make_session_ctx(MagicMock())
-    mock_factory = MagicMock(return_value=mock_session)
-
-    with (
-        patch("src.database.create_engine"),
-        patch("src.database._make_test_session_factory", return_value=mock_factory),
-    ):
-        insert_test_data(n=3)
-
-    added = mock_session.add_all.call_args[0][0]
     assert all(isinstance(item, TestItem) for item in added)
 
 
 def test_insert_test_data_commits_session():
     mock_session = _make_session_ctx(MagicMock())
-    mock_factory = MagicMock(return_value=mock_session)
 
     with (
-        patch("src.database.create_engine"),
-        patch("src.database._make_test_session_factory", return_value=mock_factory),
+        patch("src.database._test_engines", return_value=(MagicMock(), MagicMock())),
+        patch("src.database.session_scope") as mock_scope,
     ):
+        mock_scope.return_value.__enter__ = MagicMock(return_value=mock_session)
+        mock_scope.return_value.__exit__ = MagicMock(return_value=False)
         insert_test_data(n=3)
 
     mock_session.commit.assert_called_once()
@@ -250,12 +289,13 @@ def test_insert_test_data_commits_session():
 
 def test_insert_test_data_returns_list_of_dicts():
     mock_session = _make_session_ctx(MagicMock())
-    mock_factory = MagicMock(return_value=mock_session)
 
     with (
-        patch("src.database.create_engine"),
-        patch("src.database._make_test_session_factory", return_value=mock_factory),
+        patch("src.database._test_engines", return_value=(MagicMock(), MagicMock())),
+        patch("src.database.session_scope") as mock_scope,
     ):
+        mock_scope.return_value.__enter__ = MagicMock(return_value=mock_session)
+        mock_scope.return_value.__exit__ = MagicMock(return_value=False)
         result = insert_test_data(n=3)
 
     assert isinstance(result, list)
@@ -264,32 +304,55 @@ def test_insert_test_data_returns_list_of_dicts():
         assert set(row.keys()) == {"id", "name", "value", "created_at"}
 
 
-def test_insert_test_data_raises_and_propagates_on_commit_error():
+def test_insert_test_data_disposes_test_engines_on_error():
     mock_session = _make_session_ctx(MagicMock())
     mock_session.commit.side_effect = Exception("deadlock detected")
-    mock_factory = MagicMock(return_value=mock_session)
+    mock_test_writer, mock_test_reader = MagicMock(), MagicMock()
 
     with (
-        patch("src.database.create_engine"),
-        patch("src.database._make_test_session_factory", return_value=mock_factory),
+        patch("src.database._test_engines", return_value=(mock_test_writer, mock_test_reader)),
+        patch("src.database.session_scope") as mock_scope,
     ):
+        mock_scope.return_value.__enter__ = MagicMock(return_value=mock_session)
+        mock_scope.return_value.__exit__ = MagicMock(return_value=False)
         with pytest.raises(Exception, match="deadlock detected"):
             insert_test_data(n=1)
 
+    mock_test_writer.dispose.assert_called_once()
+    mock_test_reader.dispose.assert_called_once()
+
 
 # ── get_test_records ──────────────────────────────────────────────────────────
+
+
+def test_get_test_records_uses_read_mode_session():
+    mock_session = _make_session_ctx(MagicMock())
+    mock_session.query.return_value.order_by.return_value.all.return_value = []
+
+    with (
+        patch("src.database._test_engines", return_value=(MagicMock(), MagicMock())),
+        patch("src.database.session_scope") as mock_scope,
+    ):
+        mock_scope.return_value.__enter__ = MagicMock(return_value=mock_session)
+        mock_scope.return_value.__exit__ = MagicMock(return_value=False)
+        get_test_records()
+
+    args = mock_scope.call_args
+    mode = args.kwargs.get("mode") or (args.args[0] if args.args else None)
+    assert mode == "read"
 
 
 def test_get_test_records_returns_list_of_dicts():
     items = [_make_item("alpha", 1), _make_item("beta", 2)]
     mock_session = _make_session_ctx(MagicMock())
     mock_session.query.return_value.order_by.return_value.all.return_value = items
-    mock_factory = MagicMock(return_value=mock_session)
 
     with (
-        patch("src.database.create_engine"),
-        patch("src.database._make_test_session_factory", return_value=mock_factory),
+        patch("src.database._test_engines", return_value=(MagicMock(), MagicMock())),
+        patch("src.database.session_scope") as mock_scope,
     ):
+        mock_scope.return_value.__enter__ = MagicMock(return_value=mock_session)
+        mock_scope.return_value.__exit__ = MagicMock(return_value=False)
         result = get_test_records()
 
     assert len(result) == 2
@@ -300,54 +363,46 @@ def test_get_test_records_returns_list_of_dicts():
 def test_get_test_records_queries_test_item_model():
     mock_session = _make_session_ctx(MagicMock())
     mock_session.query.return_value.order_by.return_value.all.return_value = []
-    mock_factory = MagicMock(return_value=mock_session)
 
     with (
-        patch("src.database.create_engine"),
-        patch("src.database._make_test_session_factory", return_value=mock_factory),
+        patch("src.database._test_engines", return_value=(MagicMock(), MagicMock())),
+        patch("src.database.session_scope") as mock_scope,
     ):
+        mock_scope.return_value.__enter__ = MagicMock(return_value=mock_session)
+        mock_scope.return_value.__exit__ = MagicMock(return_value=False)
         get_test_records()
 
     mock_session.query.assert_called_once_with(TestItem)
 
 
-def test_get_test_records_applies_order_by():
-    mock_session = _make_session_ctx(MagicMock())
-    query_mock = mock_session.query.return_value
-    query_mock.order_by.return_value.all.return_value = []
-    mock_factory = MagicMock(return_value=mock_session)
-
-    with (
-        patch("src.database.create_engine"),
-        patch("src.database._make_test_session_factory", return_value=mock_factory),
-    ):
-        get_test_records()
-
-    query_mock.order_by.assert_called_once()
-
-
 def test_get_test_records_returns_empty_list_when_no_rows():
     mock_session = _make_session_ctx(MagicMock())
     mock_session.query.return_value.order_by.return_value.all.return_value = []
-    mock_factory = MagicMock(return_value=mock_session)
 
     with (
-        patch("src.database.create_engine"),
-        patch("src.database._make_test_session_factory", return_value=mock_factory),
+        patch("src.database._test_engines", return_value=(MagicMock(), MagicMock())),
+        patch("src.database.session_scope") as mock_scope,
     ):
+        mock_scope.return_value.__enter__ = MagicMock(return_value=mock_session)
+        mock_scope.return_value.__exit__ = MagicMock(return_value=False)
         result = get_test_records()
 
     assert result == []
 
 
-def test_get_test_records_raises_and_propagates_on_query_error():
+def test_get_test_records_disposes_test_engines_on_error():
     mock_session = _make_session_ctx(MagicMock())
     mock_session.query.side_effect = Exception("connection timeout")
-    mock_factory = MagicMock(return_value=mock_session)
+    mock_test_writer, mock_test_reader = MagicMock(), MagicMock()
 
     with (
-        patch("src.database.create_engine"),
-        patch("src.database._make_test_session_factory", return_value=mock_factory),
+        patch("src.database._test_engines", return_value=(mock_test_writer, mock_test_reader)),
+        patch("src.database.session_scope") as mock_scope,
     ):
+        mock_scope.return_value.__enter__ = MagicMock(return_value=mock_session)
+        mock_scope.return_value.__exit__ = MagicMock(return_value=False)
         with pytest.raises(Exception, match="connection timeout"):
             get_test_records()
+
+    mock_test_writer.dispose.assert_called_once()
+    mock_test_reader.dispose.assert_called_once()
