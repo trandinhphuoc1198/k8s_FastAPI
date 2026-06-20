@@ -6,9 +6,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session
 
 from src.logging import get_logger
 from src.models import Base, TestItem
@@ -29,7 +29,6 @@ DB_READER_HOST = os.getenv("DB_READER_HOST", "localhost")
 
 DB_DRIVER = os.getenv("DB_DRIVER", "psycopg2")
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _build_connection_url(host: str, db_name: str = DB_NAME) -> str:
@@ -42,10 +41,37 @@ def _random_string(length: int = 12) -> str:
     return "".join(random.choices(string.ascii_letters + string.digits, k=length))
 
 
-# ── Global engines ─────────────────────────────────────────────────────────────
+# ── Lazy engines ───────────────────────────────────────────────────────────────
+#
+# WHY LAZY: engines used to be created at module import time
+# (`writer_engine = create_engine(...)`). That forces SQLAlchemy to resolve
+# and import the psycopg2 driver the instant `src.database` is imported —
+# even just for unit tests that mock everything and never touch a real DB.
+# If psycopg2 isn't installed in that environment (e.g. a slim test venv),
+# the import itself fails with NoSuchModuleError before a single test runs.
+#
+# Creating the engine lazily, on first use, means importing this module is
+# always safe. Tests can patch `_get_writer_engine` / `_get_reader_engine`
+# (or the lower-level `create_engine`) without ever needing the real driver
+# to be importable.
 
-writer_engine: Engine = create_engine(_build_connection_url(DB_WRITER_HOST))
-reader_engine: Engine = create_engine(_build_connection_url(DB_READER_HOST))
+_writer_engine: Engine | None = None
+_reader_engine: Engine | None = None
+
+
+def _get_writer_engine() -> Engine:
+    global _writer_engine
+    if _writer_engine is None:
+        _writer_engine = create_engine(_build_connection_url(DB_WRITER_HOST))
+    return _writer_engine
+
+
+def _get_reader_engine() -> Engine:
+    global _reader_engine
+    if _reader_engine is None:
+        _reader_engine = create_engine(_build_connection_url(DB_READER_HOST))
+    return _reader_engine
+
 
 # ── Read/Write routing ─────────────────────────────────────────────────────────
 #
@@ -77,15 +103,19 @@ class RoutingSession(Session):
     module-level note above for why that approach is unsafe.
     """
 
-    def __init__(self, *args, mode: str = "write", bind_write=None, bind_read=None, **kwargs):
+    def __init__(self, *args, mode: str = "write", bind_write: Engine = None, bind_read: Engine = None, **kwargs):
         if mode not in ("read", "write"):
             raise ValueError(f"mode must be 'read' or 'write', got {mode!r}")
         self._routing_mode = mode
-        self._bind_write = bind_write if bind_write is not None else writer_engine
-        self._bind_read = bind_read if bind_read is not None else reader_engine
+        self._bind_write = bind_write if bind_write is not None else _get_writer_engine()
+        self._bind_read = bind_read if bind_read is not None else _get_reader_engine()
+        # expire_on_commit=False so objects remain readable (e.g. for
+        # serialization into a dict) immediately after commit, without
+        # needing a round-trip refresh from the DB.
+        kwargs.setdefault("expire_on_commit", False)
         super().__init__(*args, bind=self._active_bind(), **kwargs)
 
-    def _active_bind(self):
+    def _active_bind(self) -> Engine:
         return self._bind_read if self._routing_mode == "read" else self._bind_write
 
     def get_bind(self, mapper=None, clause=None, **kwargs):
@@ -98,11 +128,10 @@ class RoutingSession(Session):
 
 
 @contextmanager
-def session_scope(mode: str = "write", writer: Engine = None, reader: Engine = None):
+def session_scope(mode: str = "write", bind_write: Engine = None, bind_read: Engine = None):
     """
     Open a RoutingSession bound to the writer or reader engine for the
-    duration of the `with` block, committing on success and rolling back
-    (then closing) on error.
+    duration of the `with` block, rolling back (then closing) on error.
 
     Usage:
         with session_scope(mode="write") as session:
@@ -112,11 +141,7 @@ def session_scope(mode: str = "write", writer: Engine = None, reader: Engine = N
         with session_scope(mode="read") as session:
             rows = session.query(TestItem).all()
     """
-    session = RoutingSession(
-        mode=mode,
-        bind_write=writer if writer is not None else writer_engine,
-        bind_read=reader if reader is not None else reader_engine,
-    )
+    session = RoutingSession(mode=mode, bind_write=bind_write, bind_read=bind_read)
     try:
         yield session
     except Exception:
@@ -124,14 +149,6 @@ def session_scope(mode: str = "write", writer: Engine = None, reader: Engine = N
         raise
     finally:
         session.close()
-
-
-def _test_engines() -> tuple[Engine, Engine]:
-    """Return (writer, reader) engines pointed at the test database."""
-    return (
-        create_engine(_build_connection_url(DB_WRITER_HOST, db_name=DB_NAME)),
-        create_engine(_build_connection_url(DB_READER_HOST, db_name=DB_NAME)),
-    )
 
 
 # ── Main DB functions ──────────────────────────────────────────────────────────
@@ -143,7 +160,7 @@ def get_tables() -> list[str]:
         extra={"db.host": DB_READER_HOST, "db.port": DB_PORT, "db.name": DB_NAME},
     )
     try:
-        inspector = inspect(reader_engine)
+        inspector = inspect(_get_reader_engine())
         tables = sorted(inspector.get_table_names(schema="public"))
         logger.debug("fetched tables", extra={"db.table_count": len(tables)})
         return tables
@@ -152,33 +169,31 @@ def get_tables() -> list[str]:
         raise
 
 
-# ── Test DB functions ──────────────────────────────────────────────────────────
+# ── Test data functions (use the existing DB_NAME database) ──────────────────
 
-def create_test_database_and_table() -> None:
+def create_test_table() -> None:
     """
-    Create the test database (if it does not exist) and sync the ORM schema
-    into it via Base.metadata.create_all().
-
-    CREATE DATABASE cannot run inside a transaction block, so a raw
-    AUTOCOMMIT connection is used for that one statement only.
+    Create the test_items table in the existing database (DB_NAME) if it
+    does not already exist. Uses Base.metadata.create_all() so the schema
+    is always derived from the ORM model — no hand-written DDL needed.
     """
-    test_writer = create_engine(_build_connection_url(DB_WRITER_HOST, db_name=DB_NAME))
     try:
-        Base.metadata.create_all(bind=test_writer)
+        Base.metadata.create_all(bind=_get_writer_engine())
         logger.info(
-            "test schema synced",
+            "test table ready",
             extra={"db.name": DB_NAME, "db.table": TestItem.__tablename__},
         )
     except Exception:
-        logger.exception("error syncing test schema", extra={"db.name": DB_NAME})
+        logger.exception(
+            "error creating test table",
+            extra={"db.name": DB_NAME, "db.table": TestItem.__tablename__},
+        )
         raise
-    finally:
-        test_writer.dispose()
 
 
 def insert_test_data(n: int = 10) -> list[dict]:
     """
-    Insert *n* random TestItem rows into the test database.
+    Insert *n* random TestItem rows into the test table.
     Always routed to the writer (mode="write") — never guessed.
     """
     if n < 1:
@@ -194,9 +209,8 @@ def insert_test_data(n: int = 10) -> list[dict]:
         for _ in range(n)
     ]
 
-    test_writer, test_reader = _test_engines()
     try:
-        with session_scope(mode="write", writer=test_writer, reader=test_reader) as session:
+        with session_scope(mode="write") as session:
             session.add_all(items)
             session.commit()
             logger.info(
@@ -207,16 +221,17 @@ def insert_test_data(n: int = 10) -> list[dict]:
                     "db.row_count": n,
                 },
             )
-        return [item.to_dict() for item in items]
+            # Build the result while objects are still attached to the
+            # session — don't rely on attribute access working after the
+            # session closes.
+            result = [item.to_dict() for item in items]
+        return result
     except Exception:
         logger.exception(
             "error inserting test data",
             extra={"db.name": DB_NAME, "db.table": TestItem.__tablename__},
         )
         raise
-    finally:
-        test_writer.dispose()
-        test_reader.dispose()
 
 
 def get_test_records() -> list[dict]:
@@ -224,9 +239,8 @@ def get_test_records() -> list[dict]:
     Fetch all TestItem rows ordered by created_at descending.
     Always routed to the reader (mode="read") — never guessed.
     """
-    test_writer, test_reader = _test_engines()
     try:
-        with session_scope(mode="read", writer=test_writer, reader=test_reader) as session:
+        with session_scope(mode="read") as session:
             items = (
                 session.query(TestItem)
                 .order_by(TestItem.created_at.desc())
@@ -247,6 +261,3 @@ def get_test_records() -> list[dict]:
             extra={"db.name": DB_NAME, "db.table": TestItem.__tablename__},
         )
         raise
-    finally:
-        test_writer.dispose()
-        test_reader.dispose()

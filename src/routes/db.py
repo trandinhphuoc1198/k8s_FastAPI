@@ -1,7 +1,8 @@
 from fastapi import APIRouter, HTTPException, Query
 
 from src.database import (
-    create_test_database_and_table,
+    DB_NAME,
+    create_test_table,
     get_tables,
     get_test_records,
     insert_test_data,
@@ -18,20 +19,20 @@ def list_tables():
     """Return all public tables from the main database."""
     try:
         tables = get_tables()
-        return {"database": "TestDb", "tables": tables}
+        return {"database": DB_NAME, "tables": tables}
     except Exception as exc:
         logger.error("failed to list tables", extra={"error": str(exc)}, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.get("/test/setup", status_code=201)
-def setup_test_db():
-    """Create the test database and test table if they do not already exist."""
+def setup_test_table():
+    """Create the test table in the main database if it does not already exist."""
     try:
-        create_test_database_and_table()
-        return {"status": "ok", "message": "Test database and table are ready."}
+        create_test_table()
+        return {"status": "ok", "message": "Test table is ready."}
     except Exception as exc:
-        logger.error("failed to set up test database", extra={"error": str(exc)}, exc_info=True)
+        logger.error("failed to set up test table", extra={"error": str(exc)}, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
