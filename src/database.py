@@ -61,9 +61,9 @@ class RoutingSession(Session):
 
     def get_bind(self, mapper=None, clause=None, **kwargs):
         if clause is not None and isinstance(clause, _WRITE_CLAUSE_TYPES):
-            logger.debug("routing query to writer", extra={"db.host": DB_WRITER_HOST})
+            logger.info("routing query to writer", extra={"db.host": DB_WRITER_HOST})
             return writer_engine
-        logger.debug("routing query to reader", extra={"db.host": DB_READER_HOST})
+        logger.info("routing query to reader", extra={"db.host": DB_READER_HOST})
         return reader_engine
 
 
@@ -84,9 +84,9 @@ def _make_test_session_factory(db_name: str = DB_NAME) -> sessionmaker:
     class TestRoutingSession(RoutingSession):
         def get_bind(self, mapper=None, clause=None, **kwargs):
             if clause is not None and isinstance(clause, _WRITE_CLAUSE_TYPES):
-                logger.debug("routing test query to writer", extra={"db.host": DB_WRITER_HOST})
+                logger.info("routing test query to writer", extra={"db.host": DB_WRITER_HOST})
                 return test_writer
-            logger.debug("routing test query to reader", extra={"db.host": DB_READER_HOST})
+            logger.info("routing test query to reader", extra={"db.host": DB_READER_HOST})
             return test_reader
 
         def close(self):
@@ -101,7 +101,7 @@ def _make_test_session_factory(db_name: str = DB_NAME) -> sessionmaker:
 
 def get_tables() -> list[str]:
     """Fetch all public table names, routed automatically to the reader."""
-    logger.debug(
+    logger.info(
         "querying database for tables",
         extra={"db.host": DB_READER_HOST, "db.port": DB_PORT, "db.name": DB_NAME},
     )
@@ -109,7 +109,7 @@ def get_tables() -> list[str]:
         # inspect() is a low-level reflection call — use reader_engine directly
         inspector = inspect(reader_engine)
         tables = sorted(inspector.get_table_names(schema="public"))
-        logger.debug("fetched tables", extra={"db.table_count": len(tables)})
+        logger.info("fetched tables", extra={"db.table_count": len(tables)})
         return tables
     except Exception:
         logger.exception("error querying tables", extra={"db.name": DB_NAME})
@@ -134,7 +134,7 @@ def create_test_database_and_table() -> None:
     #         conn.execute(text(f'CREATE DATABASE "{DB_NAME}"'))
     #         logger.info("test database created", extra={"db.name": DB_NAME})
     #     else:
-    #         logger.debug("test database already exists", extra={"db.name": DB_NAME})
+    #         logger.info("test database already exists", extra={"db.name": DB_NAME})
 
     # Schema sync via ORM — no raw DDL needed
     test_writer = create_engine(_build_connection_url(DB_WRITER_HOST, db_name=DB_NAME))
@@ -204,7 +204,7 @@ def get_test_records() -> list[dict]:
                 .order_by(TestItem.created_at.desc())
                 .all()
             )
-            logger.debug(
+            logger.info(
                 "fetched test records",
                 extra={
                     "db.name": DB_NAME,
