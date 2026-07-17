@@ -1,6 +1,10 @@
 FROM python:3.12-slim
 
+ENV TMPDIR=/tmp
+
 WORKDIR /app
+
+RUN mkdir -p /tmp /var/tmp /usr/tmp && chmod 1777 /tmp /var/tmp /usr/tmp
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
